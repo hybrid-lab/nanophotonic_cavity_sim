@@ -102,7 +102,7 @@ class Cavity_simulation:
         return self
 
     @classmethod
-    def from_file(cls, filepath):
+    def from_saved_simulation_file(cls, filepath):
         """Reload from a previously saved HDF5 file without re-running
         medium fitting, mode solving, etc."""
         sim_data = td.SimulationData.from_file(filepath)
@@ -120,14 +120,9 @@ class Cavity_simulation:
         instance.sim_center = sim_data.simulation.center
         instance.sim_size = sim_data.simulation.size
         instance.run_time = sim_data.simulation.run_time
-
-        # Recompute defect bounds (needed by plotting and analysis)
         instance._compute_defect_bounds()
-
-        # Resolve the medium so analysis methods that need it work
-        instance.nanobeam_medium = instance._resolve_medium(
-            instance.context["medium"], plot=False
-        )
+        instance.nanobeam_medium = instance._resolve_medium(instance.context["medium"], plot=False)
+        instance.full_analysis()  # populate all analysis properties
 
         return instance
 
@@ -142,12 +137,6 @@ class Cavity_simulation:
         return self._analysis["resonance_df"]
 
     @property
-    def Q(self):
-        if "Q" not in self._analysis:
-            self.analyse_resonances()
-        return self._analysis["Q"]
-
-    @property
     def resonant_frequency(self):  # in Hz  
         if "resonant_frequency" not in self._analysis:
             self.analyse_resonances()
@@ -160,10 +149,22 @@ class Cavity_simulation:
         return self._analysis["resonant_wavelength"]
 
     @property
-    def combined_signal(self):
-        if "combined_signal" not in self._analysis:
+    def resonant_omega_c(self):  # in rad/s
+        if "resonant_omega_c" not in self._analysis:
             self.analyse_resonances()
-        return self._analysis["combined_signal"]
+        return self._analysis["resonant_omega_c"]
+
+    @property
+    def Q(self):
+        if "Q" not in self._analysis:
+            self.analyse_resonances()
+        return self._analysis["Q"]
+
+    @property
+    def kappa_tot(self):
+        if "kappa_tot" not in self._analysis:
+            self.decay_rates()
+        return self._analysis["kappa_tot"]
 
     @property
     def energy_density(self):
@@ -194,6 +195,12 @@ class Cavity_simulation:
         if "Q_directional" not in self._analysis:
             self.directional_Q()
         return self._analysis["Q_directional"]
+
+    @property
+    def kappa_dir(self):
+        if "kappa_dir" not in self._analysis:
+            self.decay_rates()
+        return self._analysis["kappa_dir"]
 
     # ──────────────────────────────────────────────────────────────────
     # Guards
@@ -799,9 +806,7 @@ class Cavity_simulation:
         os.makedirs(directory, exist_ok=True)
         local_path = os.path.join(directory, f"{save_name}.json")
         self.sim.to_file(local_path)
-        self.task_id = web.upload(
-            self.sim, task_name=save_name, folder_name=directory,
-        )
+        self.task_id = web.upload(self.sim, task_name=save_name, folder_name=directory,)
         return self.task_id
 
     def estimate_cost(self):
@@ -811,23 +816,14 @@ class Cavity_simulation:
         print(f"Estimated cost: {cost:.3f} FlexCredits")
         return cost
 
-    def run(self, directory, save_name, vgpu=False):
+    def run(self, directory, save_name):
         self._require_sim()
         os.makedirs(directory, exist_ok=True)
 
         if self.task_id is None:
             self.upload(directory, save_name)
 
-        kwargs = dict(
-            task_name=f"{directory}/{save_name}",
-            folder_name=directory,
-            path=os.path.join(directory, f"{save_name}.hdf5"),
-        )
-        if vgpu:
-            kwargs["priority"] = 10
-
-        self.sim_data = web.run(self.sim, **kwargs)
-        print(f"Results saved: {kwargs['path']}")
+        self.sim_data = web.run(self.sim, task_name=save_name, folder_name=directory, path=os.path.join(directory, f"{save_name}.hdf5"), verbose=True)
         return self.sim_data
 
     # ──────────────────────────────────────────────────────────────────
@@ -877,7 +873,7 @@ class Cavity_simulation:
         self._analysis["combined_signal"] = combined
         self._analysis["resonant_frequency"] = abs(best.name)    # frequency in Hz
         self._analysis["resonant_wavelength"] = abs(best["wl"])  # wavelength in um
-        self._analysis["omega_c"] = 2 * np.pi * abs(best.name)   # angular frequency in rad/s
+        self._analysis["resonant_omega_c"] = 2 * np.pi * abs(best.name)   # angular frequency in rad/s
         self._analysis["Q"] = best["Q"]
 
         kappa_tot = 2 * np.pi * abs(best.name) / best["Q"]  # total decay rate in rad/s
@@ -908,7 +904,7 @@ class Cavity_simulation:
         
         n_max = np.sqrt(abs(self.eps.max()))
 
-        Vmode = integrated / np.max(self.energy_density) / (self._analysis["resonant_wavelength"] / n_max) ** 3
+        Vmode = integrated / np.max(self.energy_density) / (self.resonant_wavelength / n_max) ** 3
 
         symmetry_factor = 1
         for s in self.sim.symmetry:
@@ -935,7 +931,7 @@ class Cavity_simulation:
                 flux_data = self.sim_data[name].flux
                 delta_t = flux_data.t[-1] - flux_data.t[0]
                 flux = abs(flux_data.integrate(coord="t")) / delta_t
-                dict_Q[name] = (self._analysis["omega_c"] * Energy / flux).values
+                dict_Q[name] = (self.resonant_omega_c * Energy / flux).values
 
         total_Q = sum(1 / q for q in dict_Q.values()) ** -1
         dict_Q["total"] = total_Q
@@ -950,11 +946,10 @@ class Cavity_simulation:
         self._require_data()
         
         Q_dir = self.Q_directional
-        omega_c = self._analysis["omega_c"]
         
         kappa = {}
         for channel, Q_val in Q_dir.items():
-            kappa[channel] = omega_c / Q_val
+            kappa[channel] = self.resonant_omega_c / Q_val
             ghz = kappa[channel] / (2 * pi * 1e9)
             print(f"  κ_{channel} / 2π = {ghz:.3f} GHz")
         
@@ -986,7 +981,7 @@ class Cavity_simulation:
         print("\n=== Summary ===")
         Q_dir = self.Q_directional
         print(f"  Q (resonance finder): {self.Q:.0f}")
-        print(f"  Kappa (total): {self._analysis['kappa_tot'] / (2 * pi * 1e9):.3f} GHz")
+        print(f"  Kappa (total): {self.kappa_tot / (2 * pi * 1e9):.3f} GHz")
         print(f"  Q (directional total): {Q_dir['total'] * 1e-6:.2f} M")
         print(f"  Mode volume: {self.Vmode:.4f} in units of (λ[um]/n)³")
         purcell = (3 / (4 * np.pi**2)) * (self.Q / self.Vmode)
@@ -1095,10 +1090,10 @@ class Cavity_simulation:
         if dipole_moment is None:
             raise ValueError("dipole_moment must be provided to calculate g.")
 
-        Vm_si = self.Vmode  * (self._analysis["resonant_wavelength"] * 1e-6 / self.n_max) ** 3                 # m³
+        Vm_si = self.Vmode  * (self.resonant_wavelength * 1e-6 / self.n_max) ** 3                 # m³
 
         # --- peak coupling rate ---
-        g_max = dipole_moment * np.sqrt(self._analysis["omega_c"] / (2 * hbar * epsilon_0 * Vm_si))
+        g_max = dipole_moment * np.sqrt(self.resonant_omega_c / (2 * hbar * epsilon_0 * Vm_si))
 
         # --- spatial profile ψ(r) = |E_pol(r)| / max|E_pol| ---
         E_t = self.sim_data[monitor_name]
@@ -1158,60 +1153,116 @@ class Cavity_simulation:
 
         return g_map, float(g_max)
 
-    def cooperativity(self, dipole_moment, position, monitor_name="Field_Profile_Monitor_x", polarization_component="Ey", channel=None, fiber_efficiency=0.99):
-        """Compute cooperativity C = 4g(r)² / (κ · γ) at a specific position.
+    def cooperativity(self, dipole_moment, monitor_name="Field_Profile_Monitor_x",
+                    polarization_component="Ey", channel=None,
+                    fiber_efficiency=0.99, plot=False, contour_levels=None,
+                    position=None):
+        """Compute cooperativity C(r) = 4g(r)² / (κ · γ) over the monitor plane.
 
         Parameters
         ----------
         dipole_moment : float
             Transition dipole moment (C·m).
-        position : dict
-            Coordinates on the monitor plane, e.g. {"y": 0.0, "z": 0.05}
-            for Field_Profile_Monitor_x.
-        gamma : float
-            Free-space spontaneous emission rate (rad/s).
-            For Rb D2: gamma = 2π × 6.07e6 ≈ 3.81e7 rad/s.
         monitor_name : str
             Which field profile monitor to use.
         polarization_component : str
             Field component aligned with the dipole.
         channel : str or None
             If None, use total κ. If e.g. "-x", use κ for that channel only.
+        fiber_efficiency : float
+            Fiber coupling efficiency (default 0.99).
+        plot : bool
+            If True, show a 2D colormap of C(r).
+        contour_levels : list of float or None
+            Draw contour lines at these cooperativity values.
+        position : dict or None
+            If provided, also print point values at this location.
 
         Returns
         -------
-        C : float
-            Cooperativity at the specified position.
+        C_map : xarray.DataArray
+            Cooperativity map C(r).
+        C_max : float
+            Peak cooperativity.
         """
         self._require_data()
 
-        omega_c = self._analysis["omega_c"]
+        gamma = self.resonant_omega_c**3 * dipole_moment**2 / (3 * pi * epsilon_0 * hbar * C0_m**3)
 
-        gamma = omega_c**3 * dipole_moment**2 / (3 * pi * epsilon_0 * hbar * C0_m**3)  # Einstein A coefficient in rad/s
-
-        # Get g map (triggers mode volume etc. if needed)
         g_map, g_max = self.coupling_g(
             dipole_moment=dipole_moment,
             monitor_name=monitor_name,
             polarization_component=polarization_component)
 
-        # Look up g at the requested position
-        g_at_r = float(g_map.sel(**position, method="nearest"))
 
-        C = 4 * g_at_r**2 / (self._analysis["kappa_tot"] * gamma)
+        C_map = 4 * g_map**2 / (self.kappa_tot * gamma)
+        C_max = float(C_map.max())
 
-        kappa_out = self._analysis["kappa_dir"].get(channel, None) if channel is not None else self._analysis["kappa_tot"]
 
-        collection_efficiency = kappa_out / self._analysis["kappa_tot"] * C / (C + 1) * fiber_efficiency
+        kappa_out = self.kappa_dir.get(channel, None)
+        eta_map = kappa_out / self.kappa_dir.get('total') * C_map / (C_map + 1) * fiber_efficiency
 
-        print(f"  g(r) / 2π = {g_at_r / (2 * pi * 1e9):.4f} GHz")
-        print(f"  κ / 2π    = {self._analysis['kappa_tot'] / (2 * pi * 1e9):.4f} GHz")
-        print(f"  κ_{channel} / 2π = {kappa_out / (2 * pi * 1e9):.4f} GHz" if channel is not None else "  κ_channel = total κ used")
-        print(f"  γ / 2π    = {gamma / (2 * pi * 1e6):.4f} MHz")
-        print(f"  C         = {C:.2f}")
-        print(f"  Collection efficiency into {channel if channel is not None else 'all channels'}: {collection_efficiency * 100:.2f}%   (assuming fiber coupling efficiency {fiber_efficiency * 100:.1f}%)")
+        # --- optional point query ---
+        if position is not None:
+            g_at_r = float(g_map.sel(**position, method="nearest"))
+            C_at_r = float(C_map.sel(**position, method="nearest"))
+            eta_at_r = float(eta_map.sel(**position, method="nearest"))
+            print(f"  g(r) / 2π = {g_at_r / (2 * pi * 1e9):.4f} GHz")
+            print(f"  γ / 2π    = {gamma / (2 * pi * 1e6):.4f} MHz")
+            print(f"  Resonance Calculation κ_tot / 2π    = {self.kappa_tot / (2 * pi * 1e9):.4f} GHz")
+            print(f"  C(r)      = {C_at_r:.2f}")
+            
+            print(f"  Directional Calculation κ_tot / 2π    = {self.kappa_dir.get('total') / (2 * pi * 1e9):.4f} GHz")
+            if channel is not None:
+                print(f" Directional Calculation κ_{channel} / 2π = {kappa_out / (2 * pi * 1e9):.4f} GHz")
+            print(f"  η(r)      = {eta_at_r * 100:.2f}%  (fiber eff. {fiber_efficiency * 100:.1f}%)")
 
-        return float(C)
+        # --- plot ---
+        if plot:
+            fig, axes = plt.subplots(1, 2, figsize=(14, 5), tight_layout=True)
+
+            axis_map = {
+                "Field_Profile_Monitor_x": ("y", "z"),
+                "Field_Profile_Monitor_y": ("x", "z"),
+                "Field_Profile_Monitor_z": ("x", "y"),
+            }
+            xax, yax = axis_map[monitor_name]
+
+            for ax, data, label, cmap in [
+                (axes[0], C_map, "C(r)", "inferno"),
+                (axes[1], eta_map * 100, "η(r) (%)", "viridis"),
+            ]:
+                im = data.plot(ax=ax, cmap=cmap, add_colorbar=False,
+                            x=xax, y=yax)
+                fig.colorbar(im, ax=ax, label=label)
+
+                if contour_levels is not None and label == "C(r)":
+                    if isinstance(contour_levels, (int, float)):
+                        contour_levels = [contour_levels]
+                    d2d = data.squeeze()
+                    coords = (getattr(d2d, xax), getattr(d2d, yax))
+                    cs = ax.contour(coords[0], coords[1], d2d.values.T,
+                                    levels=contour_levels,
+                                    colors="cyan", linewidths=1.2, linestyles="--")
+                    ax.clabel(cs, fmt="%.1f", fontsize=9, colors="cyan")
+
+                outline = Rectangle(
+                    (-self.context["width"] / 2, -self.context["thickness"] / 2),
+                    self.context["width"], self.context["thickness"],
+                    linewidth=1.5, edgecolor="white", facecolor="none",
+                    alpha=0.8, linestyle="--",
+                )
+                ax.add_patch(outline)
+                ax.set_xlabel(f"{xax} (µm)")
+                ax.set_ylabel(f"{yax} (µm)")
+                ax.set_aspect("equal")
+
+            axes[0].set_title(f"Cooperativity C(r) — {monitor_name}")
+            axes[1].set_title(f"Collection efficiency η(r) — {monitor_name}")
+            plt.show()
+
+        return C_map, C_max
+    
     # ──────────────────────────────────────────────────────────────────
     # Gaussian Fit
     # ──────────────────────────────────────────────────────────────────

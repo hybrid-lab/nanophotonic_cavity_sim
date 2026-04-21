@@ -87,44 +87,6 @@ class Cavity:
         self.simulation = None
 
     # ──────────────────────────────────────────────────────────────────
-    # Properties
-    # ──────────────────────────────────────────────────────────────────
-
-    def __len__(self):
-        return sum(self.n_cells.values())
-
-    def __repr__(self):
-        total = len(self)
-        return (
-            f"Cavity({total} cells: "
-            f"LT={self.n_cells['N_left_taper']}, "
-            f"LM={self.n_cells['N_left_mirror']}, "
-            f"D={self.n_cells['N_defect']}, "
-            f"RM={self.n_cells['N_right_mirror']}, "
-            f"RT={self.n_cells['N_right_taper']})"
-        )
-
-    # ──────────────────────────────────────────────────────────────────
-    # Simulation lifecycle
-    # ──────────────────────────────────────────────────────────────────
-
-    def build_simulation(self, **build_kwargs):
-        """Create and build the Simulation (medium fitting, mode solve, etc.)."""
-        self.simulation = Simulation(
-            parameters=self.parameters,
-            n_cells=self.n_cells,
-            context=self.context,
-            beam_layout=self.beam_layout,
-        ).build(**build_kwargs)
-        return self.simulation
-
-    def run(self, directory, save_name, **run_kwargs):
-        """Build (if needed), then run the simulation."""
-        if self.simulation is None:
-            self.build_simulation()
-        return self.simulation.run(directory, save_name, **run_kwargs)
-
-    # ──────────────────────────────────────────────────────────────────
     # Beam layout assembly
     # ──────────────────────────────────────────────────────────────────
 
@@ -209,114 +171,32 @@ class Cavity:
         ]
 
     # ──────────────────────────────────────────────────────────────────
-    # Plots
+    # Simulation lifecycle
     # ──────────────────────────────────────────────────────────────────
 
-    def plot_beam_layout(self):
-        positions = self.beam_layout["positions"]
-        lattices = self.beam_layout["lattice"]
-        hole_params = self.beam_layout["hole_params"]
+    def build_simulation(self, **build_kwargs):
+        """Create and build the Simulation (medium fitting, mode solve, etc.)."""
+        self.simulation = Cavity_simulation(
+            parameters=self.parameters,
+            n_cells=self.n_cells,
+            context=self.context,
+            beam_layout=self.beam_layout,
+        ).build(**build_kwargs)
+        return self.simulation
 
-        if hole_params.ndim == 1:
-            hole_params = hole_params[:, np.newaxis]
-
-        n_params = hole_params.shape[1]
-        n_plots = 2 + n_params
-        sections = self._section_boundaries()
-
-        fig, axes = plt.subplots(n_plots, 1, figsize=(12, 3 * n_plots), sharex=True)
-
-        # Shade sections on every subplot
-        for ax in axes:
-            for start, end, label, color in sections:
-                ax.axvspan(start - 0.5, end - 0.5, alpha=0.2, color=color)
-
-        # Positions
-        axes[0].scatter(range(len(positions)), positions, s=10, color="black")
-        axes[0].set_ylabel("Position (µm)")
-        axes[0].set_title("Hole positions")
-
-        # Lattice constants
-        axes[1].scatter(range(len(lattices)), lattices, s=10, color="black")
-        axes[1].set_ylabel("Lattice constant (µm)")
-        axes[1].set_title("Lattice constants")
-
-        # Hole parameters
-        for j in range(n_params):
-            ax = axes[2 + j]
-            ax.scatter(range(len(hole_params)), hole_params[:, j],
-                       s=10, label=f"param {j}")
-            ax.set_ylabel(f"param_{j} (µm)")
-            ax.set_title(f"Hole parameter {j}")
-            ax.legend(fontsize=8)
-
-        axes[-1].set_xlabel("Cell index")
-        plt.tight_layout()
-        plt.show()
-
-    # ──────────────────────────────────────────────────────────────────
-    # Delegation to Simulation
-    # ──────────────────────────────────────────────────────────────────
-
-    def _require_simulation(self):
-        if self.simulation is None:
-            raise RuntimeError(
-                "No simulation built. Call build_simulation() first."
-            )
-
-    def plot_simulation(self):
-        self._require_simulation()
-        self.simulation.plot_simulation()
-
-    def full_analysis(self):
-        self._require_simulation()
-        self.simulation.full_analysis()
-
-    def animate_field(self, *args, **kwargs):
-        self._require_simulation()
-        return self.simulation.animate_field(*args, **kwargs)
-
-    # ──────────────────────────────────────────────────────────────────
-    # Persistence
-    # ──────────────────────────────────────────────────────────────────
-
-    def save_params(self, directory, save_name):
-        os.makedirs(directory, exist_ok=True)
-        data = {
-            "n_cells": self.n_cells,
-            "parameters": self.parameters,
-            "context": self.context,
-        }
-        path = os.path.join(directory, f"{save_name}_parameters.json")
-        with open(path, "w") as f:
-            json.dump(_make_serializable(data), f, indent=2)
-        print(f"Parameters saved: {path}")
- 
     @staticmethod
     def _ensure_numpy_params(parameters):
-        """Convert hole_params lists back to numpy arrays (needed after JSON round-trip)."""
         for region in parameters.values():
             if isinstance(region, dict) and "hole_params" in region:
                 if isinstance(region["hole_params"], list):
                     region["hole_params"] = np.array(region["hole_params"])
         return parameters
- 
+
     @classmethod
-    def from_params(cls, filepath):
-        """Reconstruct a Cavity from a saved parameters JSON."""
-        with open(filepath, "r") as f:
-            data = json.load(f)
-        return cls(
-            n_cells=data["n_cells"],
-            parameters=cls._ensure_numpy_params(data["parameters"]),
-            context=data["context"],
-        )
- 
-    @classmethod
-    def from_simulation(cls, filepath):
+    def from_saved_simulation_file(cls, filepath):
         """Reconstruct a Cavity from a saved simulation HDF5,
         using the attrs embedded in the simulation."""
-        sim = Simulation.from_file(filepath)
+        sim = Cavity_simulation.from_saved_simulation_file(filepath)
         instance = cls(
             n_cells=sim.n_cells,
             parameters=cls._ensure_numpy_params(sim.parameters),
@@ -325,6 +205,9 @@ class Cavity:
         instance.simulation = sim
         return instance
     
+    # ──────────────────────────────────────────────────────────────────
+    # Persistence
+    # ──────────────────────────────────────────────────────────────────
 
     def get_name(self):
         """Generate a descriptive name string from n_cells and parameters."""
